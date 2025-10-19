@@ -1,13 +1,12 @@
-# proxy.py — FastAPI Tesla relay: direct-first + scrape.do fallback + diagnostics
+# proxy.py — direct-first + scrape.do fallback (configurable timeouts + sdonly)
 import os, json, time, urllib.parse, requests
 from fastapi import FastAPI, Response, Query
 
 app = FastAPI()
 
 ENDPOINT = "https://www.tesla.com/inventory/api/v1/inventory-results"
-SCRAPE_DO_TOKEN = os.environ.get("SCRAPE_DO_TOKEN")  # Render → Environment'da tanımlı olmalı
+SCRAPE_DO_TOKEN = os.environ.get("SCRAPE_DO_TOKEN")
 
-# ---------- Basit kök & sağlık ----------
 @app.get("/")
 def root():
     return {"ok": True, "endpoints": ["/health", "/inv", "/diag/direct", "/diag/sd"]}
@@ -16,7 +15,6 @@ def root():
 def health():
     return {"ok": True, "has_token": bool(SCRAPE_DO_TOKEN)}
 
-# ---------- Yardımcılar ----------
 def build_query(model="my", market="TR", language="tr", offset=0, count=50, outsideSearch=True):
     return {
         "query": {
@@ -47,8 +45,7 @@ def fetch_direct(url: str, timeout=15):
 
 def fetch_scrapedo(url: str, timeout=25):
     if not SCRAPE_DO_TOKEN:
-        content = b'{"error":"SCRAPE_DO_TOKEN not set"}'
-        return Response(status_code=502, content=content, media_type="application/json")
+        return Response(status_code=502, content=b'{"error":"SCRAPE_DO_TOKEN not set"}', media_type="application/json")
     api = f"https://api.scrape.do/?token={SCRAPE_DO_TOKEN}&url={urllib.parse.quote(url)}"
     return requests.get(api, headers={"Accept": "application/json"}, timeout=timeout)
 
@@ -62,66 +59,92 @@ def merge_results(j):
             if isinstance(v, list): out.extend(v)
     return out
 
-# ---------- Ana envanter ----------
 @app.get("/inv")
-def inv(model: str="my", market: str="TR", language: str="tr",
-        offset: int=0, count: int=50, outsideSearch: bool=True):
-
+def inv(
+    model: str = "my",
+    market: str = "TR",
+    language: str = "tr",
+    offset: int = 0,
+    count: int = 50,
+    outsideSearch: bool = True,
+    mode: str = "auto",                 # "auto" | "sdonly" | "direct"
+    direct_timeout: int = 15,
+    sd_timeout: int = 45               # <-- arttırıldı (25 → 45)
+):
     q = build_query(model, market, language, offset, count, outsideSearch)
     url = build_tesla_url(q)
 
-    # 1) Direkt Tesla
+    # sdonly: doğrudan scrape.do
+    if mode.lower() == "sdonly":
+        try:
+            sr = fetch_scrapedo(url, timeout=sd_timeout)
+            if isinstance(sr, Response):
+                print("INV: SCRAPEDO early Response ->", sr.status_code)
+                return sr
+            print(f"INV: SCRAPEDO-only status {sr.status_code}")
+            return Response(sr.content, media_type="application/json", status_code=sr.status_code,
+                            headers={"x-proxy-source":"scrapedo"})
+        except requests.RequestException as e:
+            print("INV: SCRAPEDO-only error ->", e)
+            return Response(status_code=504, content=f'{{"error":"sdonly timeout","detail":"{str(e)}"}}',
+                            media_type="application/json")
+
+    # direct-only: sadece direkt Tesla
+    if mode.lower() == "direct":
+        try:
+            dr = fetch_direct(url, timeout=direct_timeout)
+            print(f"INV: DIRECT-only status {dr.status_code}")
+            return Response(dr.content, media_type="application/json", status_code=dr.status_code,
+                            headers={"x-proxy-source":"direct"})
+        except requests.RequestException as e:
+            print("INV: DIRECT-only error ->", e)
+            return Response(status_code=504, content=f'{{"error":"direct timeout","detail":"{str(e)}"}}',
+                            media_type="application/json")
+
+    # auto: önce direct, olmazsa scrape.do
     try:
-        dr = fetch_direct(url, timeout=15)
+        dr = fetch_direct(url, timeout=direct_timeout)
         if dr.status_code == 200:
             print("INV: DIRECT 200")
             return Response(dr.content, media_type="application/json", status_code=200,
-                            headers={"x-proxy-source": "direct"})
+                            headers={"x-proxy-source":"direct"})
         else:
             print(f"INV: DIRECT status {dr.status_code} -> fallback")
     except requests.RequestException as e:
         print("INV: DIRECT error ->", e)
 
-    # 2) scrape.do fallback
     try:
-        sr = fetch_scrapedo(url, timeout=25)
+        sr = fetch_scrapedo(url, timeout=sd_timeout)
         if isinstance(sr, Response):
-            # Token eksik ise buraya düşer
             print("INV: SCRAPEDO early Response ->", sr.status_code)
             return sr
         print(f"INV: SCRAPEDO status {sr.status_code}")
         return Response(sr.content, media_type="application/json", status_code=sr.status_code,
-                        headers={"x-proxy-source": "scrapedo"})
+                        headers={"x-proxy-source":"scrapedo"})
     except requests.RequestException as e:
         print("INV: SCRAPEDO error ->", e)
-        return Response(status_code=504,
-                        content=f'{{"error":"proxy timeout","detail":"{str(e)}"}}',
+        return Response(status_code=504, content=f'{{"error":"proxy timeout","detail":"{str(e)}"}}',
                         media_type="application/json")
 
-# ---------- Teşhis: Tesla'ya doğrudan ----------
+# Teşhis uçları (değişmedi)
 @app.get("/diag/direct")
 def diag_direct():
     url = build_tesla_url(build_query())
     start = time.time()
     try:
         r = fetch_direct(url, timeout=15)
-        elapsed = round(time.time()-start, 2)
-        return {"stage":"direct", "status": r.status_code, "elapsed_s": elapsed, "len": len(r.content)}
+        return {"stage":"direct","status":r.status_code,"elapsed_s":round(time.time()-start,2),"len":len(r.content)}
     except requests.RequestException as e:
-        elapsed = round(time.time()-start, 2)
-        return {"stage":"direct", "error": str(e), "elapsed_s": elapsed}
+        return {"stage":"direct","error":str(e)}
 
-# ---------- Teşhis: scrape.do üzerinden (serbest URL) ----------
 @app.get("/diag/sd")
-def diag_sd(url: str = Query(..., description="Mutlaka tam URL ver"), timeout: int = 15):
+def diag_sd(url: str = Query(...), timeout: int = 15):
     if not SCRAPE_DO_TOKEN:
         return {"error":"SCRAPE_DO_TOKEN not set"}
     api = f"https://api.scrape.do/?token={SCRAPE_DO_TOKEN}&url={urllib.parse.quote(url)}"
     start = time.time()
     try:
         r = requests.get(api, timeout=timeout)
-        elapsed = round(time.time()-start, 2)
-        return {"stage":"scrapedo", "target": url, "status": r.status_code, "elapsed_s": elapsed, "len": len(r.content)}
+        return {"stage":"scrapedo","target":url,"status":r.status_code,"elapsed_s":round(time.time()-start,2),"len":len(r.content)}
     except requests.RequestException as e:
-        elapsed = round(time.time()-start, 2)
-        return {"stage":"scrapedo", "target": url, "error": str(e), "elapsed_s": elapsed}
+        return {"stage":"scrapedo","target":url,"error":str(e)}
